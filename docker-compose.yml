@@ -13,7 +13,7 @@ services:
     container_name: listmonk_app
     restart: unless-stopped
     ports:
-      - "9000:9000"                                           # To change the externally exposed port, change to: $custom_port:9000
+      - "8000:8000"                                           # To change the externally exposed port, change to: $custom_port:8000
     networks:
       - listmonk
     hostname: listmonk.example.com                            # Recommend using FQDN for hostname
@@ -25,7 +25,9 @@ services:
                                                               # --upgrade automatically runs any DB migrations when a new image is pulled.
 
     environment:                                              # The same params as in config.toml are passed as env vars here.
-      LISTMONK_app__address: 0.0.0.0:9000
+
+      LISTMONK_app__address: 0.0.0.0:8000
+
       LISTMONK_db__user: *db-user
       LISTMONK_db__password: *db-password
       LISTMONK_db__database: *db-name
@@ -35,9 +37,24 @@ services:
       LISTMONK_db__max_open: 25
       LISTMONK_db__max_idle: 25
       LISTMONK_db__max_lifetime: 300s
-      TZ: Etc/UTC
+
       LISTMONK_ADMIN_USER: ${LISTMONK_ADMIN_USER:-}           # If these (optional) are set during the first `docker compose up`, then the Super Admin user is automatically created.
-      LISTMONK_ADMIN_PASSWORD: ${LISTMONK_ADMIN_PASSWORD:-}   # Otherwise, the user can be setup on the web app after the first visit to http://localhost:9000
+      LISTMONK_ADMIN_PASSWORD: ${LISTMONK_ADMIN_PASSWORD:-}   # Otherwise, the user can be setup on the web app after the first visit to http://localhost:8000
+
+      LISTMONK__smtp_host: smtppro.zoho.com
+      LISTMONK__smtp_port: 587
+      LISTMONK_smtp__user: hello@thinkform.studio
+      LISTMONK_smtp__password: JwfdYF41Xh1J
+      LISTMONK_smtp__auth_protocol: login
+      LISTMONK_smtp__tls_enabled: true
+      LISTMONK_smtp__hello_hostname: thinkform.studio
+
+      TZ: Europe/Berlin
+
+      LISTMONK_MCP_URL: http://localhost:8000
+      LISTMONK_MCP_USERNAME: apiuser
+      LISTMONK_MCP_PASSWORD: iEmBdbExiSVuf7Rkhg8WtE5F8ByhzdRbbplRDkLTwM430th7
+
     volumes:
       - ./uploads:/listmonk/uploads:rw                        # Mount an uploads directory on the host to /listmonk/uploads inside the container.
                                                               # To use this, change directory path in Admin -> Settings -> Media to /listmonk/uploads
@@ -63,8 +80,56 @@ services:
         source: listmonk-data
         target: /var/lib/postgresql/data
 
+  # One-shot: creates/re-passwords the read-only postgres_exporter role.
+  # Runs every deploy (restart: "no", re-run fresh each time) since the role
+  # can't be seeded via docker-entrypoint-initdb.d on an already-initialized
+  # data volume.
+  postgres-exporter-init:
+    image: postgres:17-alpine
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGUSER: *db-user
+      PGPASSWORD: *db-password
+      PGDATABASE: *db-name
+      POSTGRES_EXPORTER_PASSWORD: ${POSTGRES_EXPORTER_PASSWORD}
+    volumes:
+      - ./postgres-exporter/init.sql:/init.sql:ro
+    entrypoint:
+      - "sh"
+      - "-c"
+      - 'psql -v ON_ERROR_STOP=1 -v exporter_password="$${POSTGRES_EXPORTER_PASSWORD}" -f /init.sql'
+    networks:
+      - listmonk
+
+  # Exposed only on the listmonk network (to reach db) and
+  # tf-observability-agent (so this server's own Alloy can scrape it and
+  # push the metrics onward to the central Prometheus) — never published
+  # to the host. See thinkform-infra/observability-agent for the scrape
+  # config, and observability-core for the dashboard.
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: listmonk-postgres-exporter
+    restart: unless-stopped
+    depends_on:
+      postgres-exporter-init:
+        condition: service_completed_successfully
+    environment:
+      DATA_SOURCE_NAME: "host=db port=5432 user=postgres_exporter password=${POSTGRES_EXPORTER_PASSWORD} dbname=listmonk sslmode=disable"
+    networks:
+      - listmonk
+      - tf-observability-agent
+
 networks:
   listmonk:
+  # Pre-existing network owned by thinkform-infra/observability-agent —
+  # lets this server's own Alloy scrape postgres-exporter without
+  # publishing it, then remote_write the metrics onward to Prometheus.
+  tf-observability-agent:
+    external: true
 
 volumes:
   listmonk-data:
